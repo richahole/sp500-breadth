@@ -74,6 +74,26 @@ def get_prices(tickers: list[str], years: int, batch: int = 100):
     return close, vol
 
 
+def get_index_ohlc(years: int) -> pd.DataFrame:
+    """标普500指数日K：Open/High/Low/Close。"""
+    import yfinance as yf
+    for attempt in range(4):
+        try:
+            d = yf.download(INDEX_TICKER, period=f"{years}y", interval="1d", auto_adjust=False, progress=False)
+            if len(d):
+                break
+        except Exception as e:
+            print(f"  index retry {attempt + 1}: {e}", file=sys.stderr)
+        time.sleep(2 ** (attempt + 1))
+    else:
+        raise RuntimeError("标普500指数下载失败")
+    if isinstance(d.columns, pd.MultiIndex):
+        d = d.xs(INDEX_TICKER, axis=1, level=-1)
+    d = d[["Open", "High", "Low", "Close"]]
+    d.index = pd.to_datetime(d.index).tz_localize(None)
+    return d
+
+
 # ---------------------------------------------------------------- 指标计算
 def compute(close: pd.DataFrame, vol: pd.DataFrame, sectors: pd.Series) -> dict:
     """close/vol: 日期 × 股票；sectors: 股票 → 板块。"""
@@ -161,15 +181,16 @@ def _r(x, nd=2):
     return round(float(x), nd)
 
 
-def build_payload(res: dict, index_close: pd.Series, meta: dict) -> dict:
+def build_payload(res: dict, index_ohlc: pd.DataFrame, meta: dict) -> dict:
     d = res["daily"].tail(DISPLAY_DAYS)
-    idx = index_close.reindex(d.index).ffill()
+    idx = index_ohlc.reindex(d.index).ffill()
     hm = res["sector_p50"].tail(HEATMAP_DAYS)
     tbl = sorted(res["sector_table"], key=lambda r: -(r["p50"] if pd.notna(r["p50"]) else -1))
     return {
         "meta": meta,
         "dates": [t.strftime("%Y-%m-%d") for t in d.index],
-        "spx": [_r(v) for v in idx],
+        # ECharts K线顺序：[开, 收, 低, 高]
+        "spx": [[_r(r.Open), _r(r.Close), _r(r.Low), _r(r.High)] for r in idx.itertuples()],
         **{k: [_r(v) for v in d[k]] for k in ["p20", "p50", "p200", "mco", "msi", "upvol"]},
         **{k: [int(v) for v in d[k]] for k in ["adv", "dec", "unch", "net", "ad", "nh", "nl", "thrust"]},
         "heat": {
@@ -201,7 +222,11 @@ def synthetic(n_stocks=500, n_days=760, seed=7):
                             for i in range(n_stocks)])
     close = pd.DataFrame(100 * np.exp(np.cumsum(rets, axis=0)), index=dates, columns=sector.index)
     vol = pd.DataFrame(rng.lognormal(14, 0.4, close.shape), index=dates, columns=sector.index)
-    spx = pd.Series(4000 * np.exp(np.cumsum(mkt)), index=dates)
+    c = 4000 * np.exp(np.cumsum(mkt))
+    o = np.r_[c[0], c[:-1]] * (1 + rng.normal(0, 0.002, n_days))
+    rng_hl = np.abs(rng.normal(0, 0.006, n_days)) * c
+    spx = pd.DataFrame({"Open": o, "Close": c, "High": np.maximum(o, c) + rng_hl,
+                        "Low": np.minimum(o, c) - rng_hl}, index=dates)
     return close, vol, sector, spx
 
 
@@ -223,8 +248,7 @@ def main():
         cons = get_constituents()
         print(f"成分股 {len(cons)} 只，开始下载 {a.years} 年日线…", file=sys.stderr)
         close, vol = get_prices(cons["yf"].tolist(), a.years)
-        spx, _ = get_prices([INDEX_TICKER], a.years)
-        spx = spx.iloc[:, 0]
+        spx = get_index_ohlc(a.years)
         sector = cons.set_index("yf")["sector"]
         got = close.columns[close.notna().sum() > 0]
         if len(got) < a.min_stocks:
@@ -331,7 +355,7 @@ footer b{color:var(--ink);font-weight:500}
 
   <section class="panel">
     <h2>指数与均线宽度</h2>
-    <p class="note">上：标普500指数。下：站上 20 / 50 / 200 日均线的成分股比例，80% 以上为过热区、20% 以下为超卖区。拖动底部滑块缩放。</p>
+    <p class="note">上：标普500指数日K线。下：站上 20 / 50 / 200 日均线的成分股比例，80% 以上为过热区、20% 以下为超卖区。拖动底部滑块缩放。</p>
     <div class="chart tall" id="c-main"></div>
   </section>
 
@@ -451,11 +475,23 @@ function drawAll() {
     yAxis: [yAx(t, { gridIndex: 0, axisLabel: { color: t.muted, formatter: v => Math.round(v).toLocaleString() } }),
             yAx(t, { gridIndex: 1, min: 0, max: 100, scale: false, interval: 20, axisLabel: { color: t.muted, formatter: '{value}%' } })],
     axisPointer: { link: [{ xAxisIndex: 'all' }] },
+    tooltip: Object.assign(base(t).tooltip, { formatter: ps => {
+      const i = ps[0].dataIndex, k = D.spx[i], pc = i > 0 ? D.spx[i - 1][1] : null;
+      const chg = pc ? (k[1] / pc - 1) * 100 : null, n = v => v == null ? '—' : v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const cc = chg == null ? t.ink : chg >= 0 ? t.up : t.down;
+      const row = (c, l, v) => `<div style="display:flex;justify-content:space-between;gap:16px"><span>${c ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${c};margin-right:6px"></span>` : ''}${l}</span><b>${v}</b></div>`;
+      return `<div style="margin-bottom:4px">${D.dates[i]}</div>` +
+        row(null, '开', n(k[0])) + row(null, '高', n(k[3])) + row(null, '低', n(k[2])) +
+        `<div style="display:flex;justify-content:space-between;gap:16px"><span>收</span><b style="color:${cc}">${n(k[1])}　${sign(chg, 2)}%</b></div>` +
+        `<div style="border-top:1px solid ${t.line};margin:4px 0"></div>` +
+        row(t.c20, '>20日线', fmt(D.p20[i]) + '%') + row(t.c50, '>50日线', fmt(D.p50[i]) + '%') + row(t.c200, '>200日线', fmt(D.p200[i]) + '%');
+    } }),
     dataZoom: [...zoom([0, 1]), { type: 'slider', xAxisIndex: [0, 1], bottom: 8, height: 22, borderColor: t.line,
       textStyle: { color: t.muted }, fillerColor: 'rgba(127,127,127,.12)', dataBackground: { lineStyle: { color: t.muted }, areaStyle: { color: t.grid } },
       startValue: Math.max(0, N - (range || N)), endValue: N - 1 }],
     series: [
-      line('标普500', D.spx, t.accent, { lineStyle: { width: 1.8, color: t.accent }, areaStyle: { color: t.accent, opacity: .07 } }),
+      { name: '标普500', type: 'candlestick', data: D.spx, barMaxWidth: 10,
+        itemStyle: { color: t.up, color0: t.down, borderColor: t.up, borderColor0: t.down, borderWidth: 1 } },
       line('>20日线', D.p20, t.c20, { xAxisIndex: 1, yAxisIndex: 1, lineStyle: { width: 1, color: t.c20, opacity: .8 },
         markArea: { silent: true, itemStyle: { color: t.warn, opacity: .07 }, data: [[{ yAxis: 80 }, { yAxis: 100 }], [{ yAxis: 0 }, { yAxis: 20 }]] } }),
       line('>50日线', D.p50, t.c50, { xAxisIndex: 1, yAxisIndex: 1, lineStyle: { width: 1.8, color: t.c50 } }),
